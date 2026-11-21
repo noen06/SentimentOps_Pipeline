@@ -1,0 +1,20 @@
+# Environments
+.conda/
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor
+.vscode/
+.idea/
+
+# Large regenerable cache (>100MB, rebuilt by `python -m src.train`)
+artifacts/embeddings_cache.npz
+
+# OS
+.DS_Store
+Thumbs.db
