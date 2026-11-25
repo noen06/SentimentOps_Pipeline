@@ -53,6 +53,7 @@ SentimentOps_Pipeline/
 │   ├── schemas.py           # SentimentResult dataclass
 │   ├── train.py / evaluate.py
 ├── artifacts/               # topic_pipeline, label/topic encoders, head weights
+├── dataset/                 # merged_twitter_sentiment.csv (44,396 texts, 13 domains)
 ├── tests/                   # pytest: API (fake model), preprocessing, model shape
 ├── scripts/                 # diagnostics: topic bias / topic effect / topic predictions
 ├── test_api.py              # smoke test against a running server (real model)
@@ -62,8 +63,17 @@ SentimentOps_Pipeline/
 
 ## Setup
 
+With `venv`:
+
 ```bash
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+```
+
+Or with conda:
+
+```bash
+conda create -p ./.conda python=3.11 -y && conda activate ./.conda
 pip install -r requirements-dev.txt
 ```
 
