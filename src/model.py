@@ -6,11 +6,6 @@ Dual-input: (roberta_embedding, topic_id) → 3-class softmax.
 import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers
 
-try:
-    import tensorflow_addons as tfa
-except ImportError:
-    tfa = None
-
 from configs.config import (
     ROBERTA_DIM,
     TOPIC_EMBEDDING_DIM,
@@ -89,22 +84,14 @@ def build_sentiment_head(num_topics: int) -> Model:
 
 def compile_model(model: Model) -> Model:
     """
-    Compile with AdamW.
-    Using tensorflow_addons.AdamW for proper decoupled weight decay.
-    Falls back to standard Adam if tfa is unavailable.
+    Compile with AdamW (decoupled weight decay).
+    tf.keras.optimizers.AdamW is built into TF >= 2.11, so the old
+    tensorflow_addons dependency (deprecated, unmaintained) is no longer needed.
     """
-    if tfa is None:
-        print("[model] tensorflow_addons not available, falling back to Adam.")
-        optimizer = optimizers.Adam(learning_rate=LEARNING_RATE)
-    else:
-        try:
-            optimizer = tfa.optimizers.AdamW(
-                learning_rate=LEARNING_RATE,
-                weight_decay=WEIGHT_DECAY,
-            )
-        except Exception:
-            print("[model] tensorflow_addons not available, falling back to Adam.")
-            optimizer = optimizers.Adam(learning_rate=LEARNING_RATE)
+    optimizer = optimizers.AdamW(
+        learning_rate=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
 
     model.compile(
         optimizer=optimizer,

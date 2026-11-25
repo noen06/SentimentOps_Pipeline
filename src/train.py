@@ -101,6 +101,7 @@ def train_topic_classifier(
 
 def main() -> None:
     set_seeds()
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Load & clean data ──────────────────────────────────────────────────
     raw_df = load_raw_data(DATA_DIR / "merged_twitter_sentiment.csv")
@@ -117,8 +118,6 @@ def main() -> None:
     joblib.dump(topic_encoder, ARTIFACT_DIR / "topic_encoder.joblib")
 
     # ── 4. Stratified split ───────────────────────────────────────────────────
-    from sklearn.model_selection import train_test_split
-
     X_trainval, X_test, y_trainval, y_test, t_trainval, t_test = train_test_split(
         df["text"].tolist(), labels, topics,
         test_size=0.15, stratify=labels, random_state=SEED,

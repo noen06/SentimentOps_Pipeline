@@ -1,0 +1,10 @@
+.conda
+.git
+.github
+.vscode
+dataset
+artifacts/embeddings_cache.npz
+**/__pycache__
+*.pyc
+tests
+.pytest_cache

@@ -1,193 +1,198 @@
 """
-Production inference pipeline.
-InferencePipeline loads all artifacts once at startup and
-exposes a single predict_sentiment() method for serving.
+Production inference pipeline for TESA-CF.
 
-Memory management strategy:
-- RoBERTa runs on GPU if available, releases after extraction.
-- TF Keras head runs on CPU by default to avoid CUDA context conflict.
-  Set TF_FORCE_GPU=1 env var to override if you have enough VRAM.
+InferencePipeline loads every artifact ONCE (at server startup) and exposes:
+    - predict_batch(texts)      -> list[SentimentResult]   (the real work)
+    - predict_sentiment(text)   -> SentimentResult         (wrapper over batch)
+
+Design notes (why it looks like this):
+    * True batching: one tokenizer call + one RoBERTa forward pass + one
+      vectorised TF-IDF predict + one Keras call for the whole batch,
+      instead of looping N times.
+    * Dynamic padding (padding=True): pad to the longest text in the batch,
+      not to MAX_LEN=128. Because we use attention-mask mean pooling, pad
+      tokens never affect the embedding -> same result, much less compute.
+    * Direct Keras call `model(x, training=False)` instead of `model.predict()`
+      — predict() builds a tf.data pipeline every call (slow for small inputs).
+    * TensorFlow head is pinned to CPU with tf.config.set_visible_devices,
+      so TF does not grab the GPU memory PyTorch needs.
+      (Setting CUDA_VISIBLE_DEVICES after TF is imported has no effect.)
+    * A lock serialises access: HuggingFace fast tokenizers are not safe to
+      call from several threads at once ("Already borrowed" error), and FastAPI
+      runs sync endpoints in a thread pool.
 """
 
-import os
-import gc
-import numpy as np
-import torch
-import joblib
-import tensorflow as tf
-from dataclasses import dataclass
+from __future__ import annotations
+
+import logging
+import threading
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModel
+
+import joblib
+import numpy as np
+import tensorflow as tf
+import torch
+from transformers import AutoModel, AutoTokenizer
 
 from configs.config import (
-    ROBERTA_CHECKPOINT, MAX_LEN, ROBERTA_DIM,
-    TOPIC_PIPELINE_PATH, LABEL_ENCODER_PATH, KERAS_WEIGHTS_PATH,
-    ARTIFACT_DIR, ID_TO_LABEL, NUM_CLASSES, TOPIC_EMBEDDING_DIM,
-    DROPOUT_RATE,
+    ARTIFACT_DIR,
+    INFER_BATCH_SIZE,
+    MAX_LEN,
+    ROBERTA_CHECKPOINT,
+    TORCH_NUM_THREADS,
 )
 from src.data_preprocess import clean_text
 from src.model import build_sentiment_head
+from src.schemas import SentimentResult
+
+logger = logging.getLogger(__name__)
+
+EMPTY_TEXT_WARNING = "empty_after_cleaning: text had no usable words, returned a neutral fallback"
 
 
-@dataclass
-class SentimentResult:
-    label: str          # "Negative" | "Neutral" | "Positive"
-    confidence: float   # probability of predicted class
-    probabilities: dict[str, float]  # full distribution
-    predicted_topic: str             # topic predicted by auxiliary classifier
-    cleaned_text: str               # text after preprocessing
+def _pin_tensorflow_to_cpu() -> None:
+    """Hide GPUs from TensorFlow. Must run before TF initialises its devices."""
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except (RuntimeError, ValueError) as exc:  # devices already initialised
+        logger.warning("Could not pin TensorFlow to CPU: %s", exc)
+
+
+def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Masked mean pooling: average only over real tokens, ignore padding."""
+    mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)   # (B, L, 1)
+    summed = (last_hidden_state * mask).sum(dim=1)                     # (B, 768)
+    counts = mask.sum(dim=1).clamp(min=1e-9)                           # (B, 1)
+    return summed / counts
 
 
 class InferencePipeline:
     """
-    Loads all artifacts once and provides fast single-text inference.
-
     Usage:
         pipeline = InferencePipeline()
-        result = pipeline.predict_sentiment("The game keeps crashing!")
-        print(result.label, result.confidence)
+        pipeline.predict_sentiment("The game keeps crashing!").label
+        pipeline.predict_batch(["great hotel", "awful service"])
     """
 
-    def __init__(
-        self,
-        artifact_dir: Path = ARTIFACT_DIR,
-        force_cpu_keras: bool = True,
-    ) -> None:
-        print("[InferencePipeline] Initializing...")
-
-        self._artifact_dir = artifact_dir
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Step 1: Load sklearn artifacts (fast, CPU only)
-        self._topic_pipeline  = self._load_topic_pipeline()
-        self._label_encoder   = self._load_label_encoder()
-        self._topic_encoder   = joblib.load(artifact_dir / "topic_encoder.joblib")
-        self._num_topics      = len(self._topic_encoder.classes_)
-
-        # Step 2: Load RoBERTa tokenizer + model (PyTorch)
-        self._tokenizer, self._roberta = self._load_roberta()
-
-        # Step 3: Load Keras classification head
-        # Force TF to use CPU to avoid CUDA conflict with PyTorch
+    def __init__(self, artifact_dir: Path = ARTIFACT_DIR, force_cpu_keras: bool = True) -> None:
         if force_cpu_keras:
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        self._keras_model = self._load_keras_model()
+            _pin_tensorflow_to_cpu()
+        if TORCH_NUM_THREADS > 0:
+            torch.set_num_threads(TORCH_NUM_THREADS)
 
-        print("[InferencePipeline] All artifacts loaded. Ready.")
+        artifact_dir = Path(artifact_dir)
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._lock = threading.Lock()
 
-    # ── Private loaders ───────────────────────────────────────────────────────
+        logger.info("Loading sklearn artifacts from %s", artifact_dir)
+        self._topic_pipeline = joblib.load(artifact_dir / "topic_pipeline.joblib")
+        label_encoder = joblib.load(artifact_dir / "label_encoder.joblib")
+        topic_encoder = joblib.load(artifact_dir / "topic_encoder.joblib")
 
-    def _load_topic_pipeline(self):
-        print("[InferencePipeline] Loading topic classifier...")
-        return joblib.load(TOPIC_PIPELINE_PATH)
+        # Pre-compute names once (no inverse_transform per request)
+        self.class_names: list[str] = [str(c) for c in label_encoder.classes_]
+        self.topic_names: list[str] = [str(t) for t in topic_encoder.classes_]
+        self.num_topics = len(self.topic_names)
 
-    def _load_label_encoder(self):
-        print("[InferencePipeline] Loading label encoder...")
-        return joblib.load(LABEL_ENCODER_PATH)
+        logger.info("Loading RoBERTa (%s) on %s", ROBERTA_CHECKPOINT, self._device)
+        self._tokenizer = AutoTokenizer.from_pretrained(ROBERTA_CHECKPOINT)
+        self._roberta = AutoModel.from_pretrained(ROBERTA_CHECKPOINT).to(self._device).eval()
+        for p in self._roberta.parameters():
+            p.requires_grad = False
 
-    def _load_roberta(self) -> tuple:
-        print(f"[InferencePipeline] Loading RoBERTa on {self._device}...")
-        tokenizer = AutoTokenizer.from_pretrained(ROBERTA_CHECKPOINT)
-        model = AutoModel.from_pretrained(ROBERTA_CHECKPOINT)
-        model.eval()
-        model.to(self._device)
-        for param in model.parameters():
-            param.requires_grad = False
-        return tokenizer, model
+        logger.info("Loading Keras sentiment head")
+        self._head = build_sentiment_head(num_topics=self.num_topics)
+        self._head.load_weights(str(artifact_dir / "sentiment_head.weights.h5"))
 
-    def _load_keras_model(self) -> tf.keras.Model:
-        print("[InferencePipeline] Loading Keras classification head...")
-        model = build_sentiment_head(num_topics=self._num_topics)
-        model.load_weights(str(KERAS_WEIGHTS_PATH))
-        return model
+        # Warm-up: first call pays graph / kernel initialisation cost,
+        # do it now instead of on the first user request.
+        self.predict_batch(["warm up the model"])
+        logger.info("InferencePipeline ready (topics=%d, device=%s)", self.num_topics, self._device)
 
-    # ── Core inference ────────────────────────────────────────────────────────
+    # ── Info ──────────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def _extract_embedding(self, text: str) -> np.ndarray:
-        """Extract 768-d mean-pooled embedding for a single cleaned text."""
-        encoding = self._tokenizer(
-            text,
-            max_length=MAX_LEN,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids      = encoding["input_ids"].to(self._device)
-        attention_mask = encoding["attention_mask"].to(self._device)
+    @property
+    def device(self) -> str:
+        return str(self._device)
 
-        outputs = self._roberta(input_ids=input_ids, attention_mask=attention_mask)
+    # ── Core steps ────────────────────────────────────────────────────────────
 
-        # Mean pooling (same as training)
-        mask_expanded = attention_mask.unsqueeze(-1).expand(
-            outputs.last_hidden_state.size()
-        ).float()
-        sum_emb  = torch.sum(outputs.last_hidden_state * mask_expanded, dim=1)
-        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-        embedding = (sum_emb / sum_mask).cpu().numpy()
+    @torch.inference_mode()
+    def _embed(self, texts: list[str]) -> np.ndarray:
+        """Cleaned texts -> (N, 768) float32 embeddings, chunked by INFER_BATCH_SIZE."""
+        chunks = []
+        for start in range(0, len(texts), INFER_BATCH_SIZE):
+            batch = texts[start:start + INFER_BATCH_SIZE]
+            enc = self._tokenizer(
+                batch,
+                max_length=MAX_LEN,
+                truncation=True,
+                padding=True,              # dynamic padding
+                return_tensors="pt",
+            ).to(self._device)
+            out = self._roberta(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+            chunks.append(mean_pool(out.last_hidden_state, enc["attention_mask"]).cpu().numpy())
+        return np.concatenate(chunks).astype(np.float32)
 
-        return embedding.astype(np.float32)  # shape: (1, 768)
+    def _classify(self, cleaned: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (probs (N,3), topic_ids (N,)) for non-empty cleaned texts."""
+        embeddings = self._embed(cleaned)
+        topic_ids = np.asarray(self._topic_pipeline.predict(cleaned), dtype=np.int32)
+        probs = self._head(
+            {
+                "text_embedding": tf.constant(embeddings),
+                "topic_id": tf.constant(topic_ids.reshape(-1, 1)),
+            },
+            training=False,   # BatchNorm uses moving stats, Dropout off
+        ).numpy()
+        return probs, topic_ids
 
-    def predict_sentiment(self, text: str) -> SentimentResult:
-        """
-        Full inference pipeline for a single raw text string.
-
-        Steps:
-        1. Clean text
-        2. Extract RoBERTa embedding (PyTorch)
-        3. Predict topic (Sklearn TF-IDF + LR)
-        4. Run Keras classification head
-        5. Return structured result
-        """
-        # ── 1. Preprocess ─────────────────────────────────────────────────────
-        cleaned = clean_text(text)
-        if not cleaned:
-            return SentimentResult(
-                label="Neutral",
-                confidence=0.0,
-                probabilities={"Negative": 0.0, "Neutral": 1.0, "Positive": 0.0},
-                predicted_topic="unknown",
-                cleaned_text=cleaned,
-            )
-
-        # ── 2. Embed ──────────────────────────────────────────────────────────
-        embedding = self._extract_embedding(cleaned)  # (1, 768)
-
-        # ── 3. Predict topic ──────────────────────────────────────────────────
-        topic_id_arr  = self._topic_pipeline.predict([cleaned])  # (1,)
-        topic_id      = int(topic_id_arr[0])
-
-        # Decode topic name for logging/output
-        try:
-            topic_name = self._topic_encoder.inverse_transform([topic_id])[0]
-        except Exception:
-            topic_name = "unknown"
-
-        topic_id_input = np.array([[topic_id]], dtype=np.int32)  # (1, 1)
-
-        # ── 4. Keras classification head ──────────────────────────────────────
-        probs = self._keras_model.predict(
-            {"text_embedding": embedding, "topic_id": topic_id_input},
-            verbose=0,
-        )[0]  # shape: (3,)
-
-        pred_idx    = int(np.argmax(probs))
-        pred_label  = self._label_encoder.inverse_transform([pred_idx])[0]
-        confidence  = float(probs[pred_idx])
-
-        prob_dict = {
-            self._label_encoder.inverse_transform([i])[0]: float(p)
-            for i, p in enumerate(probs)
-        }
-
+    def _to_result(self, probs: np.ndarray, topic_id: int, cleaned: str) -> SentimentResult:
+        idx = int(np.argmax(probs))
+        topic = self.topic_names[topic_id] if 0 <= topic_id < self.num_topics else "unknown"
         return SentimentResult(
-            label=pred_label,
-            confidence=round(confidence, 4),
-            probabilities={k: round(v, 4) for k, v in prob_dict.items()},
-            predicted_topic=topic_name,
+            label=self.class_names[idx],
+            confidence=round(float(probs[idx]), 4),
+            probabilities={n: round(float(p), 4) for n, p in zip(self.class_names, probs)},
+            predicted_topic=topic,
             cleaned_text=cleaned,
         )
 
+    def _empty_result(self, cleaned: str) -> SentimentResult:
+        uniform = round(1.0 / len(self.class_names), 4)
+        return SentimentResult(
+            label="Neutral",
+            confidence=uniform,
+            probabilities={n: uniform for n in self.class_names},
+            predicted_topic="unknown",
+            cleaned_text=cleaned,
+            warnings=[EMPTY_TEXT_WARNING],
+        )
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def predict_batch(self, texts: list[str]) -> list[SentimentResult]:
-        """Convenience wrapper for batch inference (calls predict_sentiment in loop)."""
-        return [self.predict_sentiment(t) for t in texts]
+        """Batch inference. Order of results == order of inputs."""
+        if not texts:
+            return []
+
+        cleaned = [clean_text(t) for t in texts]
+        valid_idx = [i for i, c in enumerate(cleaned) if c]
+        results: list[SentimentResult | None] = [None] * len(texts)
+
+        if valid_idx:
+            valid_texts = [cleaned[i] for i in valid_idx]
+            with self._lock:
+                probs, topic_ids = self._classify(valid_texts)
+            for j, i in enumerate(valid_idx):
+                results[i] = self._to_result(probs[j], int(topic_ids[j]), cleaned[i])
+
+        for i, c in enumerate(cleaned):
+            if results[i] is None:
+                results[i] = self._empty_result(c)
+
+        return results  # type: ignore[return-value]
+
+    def predict_sentiment(self, text: str) -> SentimentResult:
+        """Single-text inference (same code path as batch -> no train/serve drift)."""
+        return self.predict_batch([text])[0]

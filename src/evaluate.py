@@ -87,10 +87,8 @@ def main(parity_n: int) -> None:
         rng = np.random.default_rng(SEED)
         idx = rng.choice(len(X_test), size=min(parity_n, len(X_test)), replace=False)
         pipeline = InferencePipeline()
-        agree = 0
-        for i in idx:
-            result = pipeline.predict_sentiment(X_test[i])
-            agree += int(result.label == label_encoder.classes_[y_pred[i]])
+        results = pipeline.predict_batch([X_test[i] for i in idx])   # one batched call
+        agree = sum(int(r.label == label_encoder.classes_[y_pred[i]]) for r, i in zip(results, idx))
         print(f"\n=== Kiểm tra khớp: InferencePipeline vs đường batch ===")
         print(f"Cùng nhãn: {agree}/{len(idx)} ({agree / len(idx):.1%})")
 
