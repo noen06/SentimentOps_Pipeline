@@ -39,6 +39,8 @@ On 44,396 texts across 13 domains (stratified 70/15/15 split):
 
 Ablation (macro-F1): no skip connection 0.8574 · no topic embedding 0.8491 · no BatchNorm 0.8356.
 
+**Reproducing with this repo:** the artifacts in `artifacts/` were retrained with the packaged preprocessing. That cleaning keeps 44,441 rows, so the test split has 6,667 texts. `python -m src.evaluate` on these saved weights gives **accuracy 0.8806, macro-F1 0.8698**, within the seed-to-seed variance reported above. Evaluating saved weights is deterministic. Retraining from scratch varies slightly because of random initialization, shuffling and non-deterministic GPU ops.
+
 ## Project structure
 
 ```
@@ -53,7 +55,7 @@ SentimentOps_Pipeline/
 │   ├── schemas.py           # SentimentResult dataclass
 │   ├── train.py / evaluate.py
 ├── artifacts/               # topic_pipeline, label/topic encoders, head weights
-├── dataset/                 # merged_twitter_sentiment.csv (44,396 texts, 13 domains)
+├── dataset/                 # merged_twitter_sentiment.csv (13 domains; 44,441 rows after cleaning)
 ├── tests/                   # pytest: API (fake model), preprocessing, model shape
 ├── scripts/                 # diagnostics: topic bias / topic effect / topic predictions
 ├── test_api.py              # smoke test against a running server (real model)

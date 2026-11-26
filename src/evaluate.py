@@ -24,7 +24,7 @@ def rebuild_test_split():
     """Dựng lại tập test đúng như train.py: cùng cleaning, cùng seed, cùng stratify."""
     raw_df = pd.read_csv(DATA_DIR / "merged_twitter_sentiment.csv")
     df = clean_dataframe(raw_df, text_col="text", label_col="sentiment")
-    print(f"[evaluate] Corpus sau khi làm sạch: {len(df)} dòng")
+    print(f"[evaluate] Corpus after cleaning: {len(df)} rows")
 
     label_encoder = joblib.load(LABEL_ENCODER_PATH)
     labels = label_encoder.transform(df["sentiment"]).astype(np.int32)
@@ -42,14 +42,14 @@ def main(parity_n: int) -> None:
     import tensorflow as tf  # import muộn để lỗi cài đặt hiện rõ ở đây
 
     X_test, y_test, topic_names, label_encoder = rebuild_test_split()
-    print(f"[evaluate] Kích thước tập test: {len(X_test)}")
+    print(f"[evaluate] Test set size: {len(X_test)}")
 
     # Embedding của test đã được cache lúc train, thứ tự khớp với X_test
     test_emb = np.load(EMBEDDINGS_CACHE)["test"]
     if len(test_emb) != len(X_test):
         raise RuntimeError(
-            f"Cache có {len(test_emb)} embedding nhưng tập test dựng lại có {len(X_test)} dòng. "
-            "Cleaning/split hiện tại không khớp với lần train, kết quả sẽ không đáng tin."
+            f"Cache has {len(test_emb)} embeddings but the rebuilt test set has {len(X_test)} rows. "
+            "Current cleaning/split does not match the training run; results would be unreliable."
         )
 
     topic_pipeline = joblib.load(TOPIC_PIPELINE_PATH)
@@ -65,15 +65,15 @@ def main(parity_n: int) -> None:
     y_pred = np.argmax(probs, axis=1)
 
     # ── Toàn bộ tập test ─────────────────────────────────────────────────────
-    print("\n=== Toàn bộ tập test ===")
+    print("\n=== Full test set ===")
     print(f"Accuracy : {accuracy_score(y_test, y_pred):.4f}")
     print(f"Macro F1 : {f1_score(y_test, y_pred, average='macro'):.4f}")
     print(classification_report(y_test, y_pred, target_names=label_encoder.classes_, digits=4))
-    print("Confusion matrix (hàng = thật, cột = dự đoán):")
+    print("Confusion matrix (rows = true, cols = predicted):")
     print(confusion_matrix(y_test, y_pred))
 
     # ── Tách theo miền (dùng topic thật để chia miền) ────────────────────────
-    print("\n=== Theo miền ===")
+    print("\n=== By domain ===")
     is_hotel = topic_names == "hotel"
     for name, mask in [("Social-media", ~is_hotel), ("Hotel-review", is_hotel)]:
         acc = accuracy_score(y_test[mask], y_pred[mask])
@@ -89,8 +89,8 @@ def main(parity_n: int) -> None:
         pipeline = InferencePipeline()
         results = pipeline.predict_batch([X_test[i] for i in idx])   # one batched call
         agree = sum(int(r.label == label_encoder.classes_[y_pred[i]]) for r, i in zip(results, idx))
-        print(f"\n=== Kiểm tra khớp: InferencePipeline vs đường batch ===")
-        print(f"Cùng nhãn: {agree}/{len(idx)} ({agree / len(idx):.1%})")
+        print("\n=== Parity check: InferencePipeline vs offline batch path ===")
+        print(f"Same label: {agree}/{len(idx)} ({agree / len(idx):.1%})")
 
 
 if __name__ == "__main__":
